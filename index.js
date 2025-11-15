@@ -24,7 +24,8 @@ const TOKEN = process.env.DISCORD_TOKEN || 'ВСТАВЬ_ТОКЕН_ЕСЛИ_Б�
 const TARGET_USER_ID = process.env.TARGET_USER_ID || 'ID_ПОЛЬЗОВАТЕЛЯ';
 const CLEAN_ONLY_TARGET = true; // true — чистим только TARGET_USER_ID
 const TZ = 'Europe/Riga';
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ''; // <— ID текстового канала для журнала
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ''; // ID канала для журнала
+const SCAN_INTERVAL_MIN = Number(process.env.SCAN_INTERVAL_MIN || 60); // авто-проверка каждые N минут
 
 if (!TOKEN || TOKEN === 'ВСТАВЬ_ТОКЕН_ЕСЛИ_БЕЗ_.ENV') {
   console.error('Нет токена. Укажи DISCORD_TOKEN в .env или вставь прямо в код.');
@@ -36,10 +37,10 @@ const DEFAULT_PRESENCE = {
   activities: [{ name: 'за порядком', type: ActivityType.Watching }],
   status: 'online',
 };
-async function setCheckingPresence() {
+async function setCheckingPresence(text = 'всё ли ок', status = 'dnd') {
   await client.user.setPresence({
-    activities: [{ name: 'всё ли ок', type: ActivityType.Watching }],
-    status: 'dnd',
+    activities: [{ name: text, type: ActivityType.Watching }],
+    status,
   });
 }
 async function setDefaultPresence() {
@@ -49,6 +50,8 @@ async function setDefaultPresence() {
 client.once('ready', () => {
   console.log(`Залогинен как ${client.user.tag}`);
   client.user.setPresence(DEFAULT_PRESENCE);
+  // Запускаем планировщик после логина
+  scheduleHourlyScan();
 });
 
 // ===== утилиты времени =====
@@ -122,7 +125,7 @@ function removeArturLike(s, forChannel = false) {
 const logs = []; // { ts, type: 'nick'|'channel', guildId, userId?, channelId?, before, after, count }
 
 async function logToChannel(entry) {
-  if (!LOG_CHANNEL_ID) return; // канал не задан — просто пропускаем
+  if (!LOG_CHANNEL_ID) return;
   const guild = client.guilds.cache.get(entry.guildId);
   if (!guild) return;
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID) || await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
@@ -150,7 +153,6 @@ async function logToChannel(entry) {
 
 function pushLog(entry) {
   logs.push(entry);
-  // отправляем в канал
   logToChannel(entry);
 }
 
@@ -163,7 +165,7 @@ function getTodayStats() {
   return { totalRemoved, nickOps, chOps, todayLogs };
 }
 
-// ===== авто-чистка ника =====
+// ===== авто-чистка ника (события) =====
 client.on('guildMemberUpdate', async (_oldMember, newMember) => {
   try {
     if (CLEAN_ONLY_TARGET && newMember.id !== TARGET_USER_ID) return;
@@ -192,7 +194,7 @@ client.on('guildMemberUpdate', async (_oldMember, newMember) => {
   }
 });
 
-// ===== авто-чистка названий каналов =====
+// ===== авто-чистка названий каналов (события) =====
 function cleanChannelName(name) {
   return containsArturLike(name) ? removeArturLike(name, true) : name;
 }
@@ -245,6 +247,101 @@ client.on('channelUpdate', async (_oldChannel, newChannel) => {
   }
 });
 
+// ===== плановая проверка по расписанию =====
+let scanTimer = null;
+let scanRunning = false;
+
+async function runFullScanForGuild(guild) {
+  // защищаемся от параллельных запусков
+  if (scanRunning) return;
+  scanRunning = true;
+
+  try {
+    await setCheckingPresence('плановая проверка', 'online');
+
+    // 1) Ники
+    const members = await guild.members.fetch();
+    for (const [, m] of members) {
+      if (CLEAN_ONLY_TARGET && m.id !== TARGET_USER_ID) continue;
+      const current = m.nickname || m.user.username;
+      const c = countArturLike(current);
+      if (!c) continue;
+      const cleaned = removeArturLike(current, false);
+      if (cleaned && cleaned !== current) {
+        await m.setNickname(cleaned).catch(() => {});
+        pushLog({
+          ts: Date.now(),
+          type: 'nick',
+          guildId: guild.id,
+          userId: m.id,
+          before: current,
+          after: cleaned,
+          count: c,
+        });
+      }
+    }
+
+    // 2) Каналы
+    for (const [, ch] of guild.channels.cache) {
+      const name = ch.name;
+      const c = countArturLike(name);
+      if (!c) continue;
+      const cleaned = removeArturLike(name, true);
+      if (cleaned !== name) {
+        await ch.setName(cleaned).catch(() => {});
+        pushLog({
+          ts: Date.now(),
+          type: 'channel',
+          guildId: guild.id,
+          channelId: ch.id,
+          before: name,
+          after: cleaned,
+          count: c,
+        });
+      }
+    }
+  } catch (e) {
+    console.error('Ошибка плановой проверки:', e);
+  } finally {
+    await setDefaultPresence();
+    scanRunning = false;
+  }
+}
+
+// выровнять на начало часа, затем каждые SCAN_INTERVAL_MIN минут
+function scheduleHourlyScan() {
+  const intervalMs = Math.max(1, SCAN_INTERVAL_MIN) * 60 * 1000;
+
+  // первичный запуск: выровнять к началу ближайшего интервала
+  const now = new Date();
+  const msSinceHour = (now.getMinutes() * 60 + now.getSeconds()) * 1000 + now.getMilliseconds();
+  const msToNext = intervalMs - (msSinceHour % intervalMs);
+
+  // запустить разово сразу (не ждём час): удобно при старте
+  (async () => {
+    for (const [, g] of client.guilds.cache) {
+      await runFullScanForGuild(g);
+    }
+  })();
+
+  // потом — по расписанию
+  setTimeout(() => {
+    // первый тик по выравниванию
+    (async () => {
+      for (const [, g] of client.guilds.cache) {
+        await runFullScanForGuild(g);
+      }
+    })();
+
+    // регулярный интервал
+    scanTimer = setInterval(async () => {
+      for (const [, g] of client.guilds.cache) {
+        await runFullScanForGuild(g);
+      }
+    }, intervalMs);
+  }, msToNext);
+}
+
 // ===== команды =====
 client.on('messageCreate', async (message) => {
   try {
@@ -284,18 +381,20 @@ client.on('messageCreate', async (message) => {
         }
       });
       await message.reply(
-        `Подробности за сегодня (показаны последние ${Math.min(MAX, todayLogs.length)}):\n` +
+        `Подробности за сегодня (последние ${Math.min(MAX, todayLogs.length)}):\n` +
         lines.join('\n')
       );
       return;
     }
 
-    // !cleanartur
+    // !cleanartur — ручная мгновенная проверка
     if (isMod && message.content.trim().toLowerCase() === '!cleanartur') {
       await setCheckingPresence();
       try {
-        // 1) ники
-        const members = await message.guild.members.fetch();
+        const guild = message.guild;
+
+        // Ники
+        const members = await guild.members.fetch();
         for (const [, m] of members) {
           if (CLEAN_ONLY_TARGET && m.id !== TARGET_USER_ID) continue;
           const current = m.nickname || m.user.username;
@@ -304,38 +403,38 @@ client.on('messageCreate', async (message) => {
           const cleaned = removeArturLike(current, false);
           if (cleaned && cleaned !== current) {
             await m.setNickname(cleaned).catch(() => {});
-            const entry = {
+            pushLog({
               ts: Date.now(),
               type: 'nick',
-              guildId: message.guild.id,
+              guildId: guild.id,
               userId: m.id,
               before: current,
               after: cleaned,
               count: c,
-            };
-            pushLog(entry);
+            });
           }
         }
-        // 2) каналы
-        for (const [, ch] of message.guild.channels.cache) {
+
+        // Каналы
+        for (const [, ch] of guild.channels.cache) {
           const name = ch.name;
           const c = countArturLike(name);
           if (!c) continue;
           const cleaned = removeArturLike(name, true);
           if (cleaned !== name) {
             await ch.setName(cleaned).catch(() => {});
-            const entry = {
+            pushLog({
               ts: Date.now(),
               type: 'channel',
-              guildId: message.guild.id,
+              guildId: guild.id,
               channelId: ch.id,
               before: name,
               after: cleaned,
               count: c,
-            };
-            pushLog(entry);
+            });
           }
         }
+
         await message.reply('Готово: всё, похожее на «артур», почищено ✅');
       } catch (err) {
         console.error('Ошибка при ручной чистке:', err);
