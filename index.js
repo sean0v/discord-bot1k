@@ -448,5 +448,13 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+import express from "express"; // если используешь ES-модули
+// или, если CommonJS:
+const express = require("express");
+
+const app = express();
+app.get("/", (req, res) => res.send("Anti-Artur Bot is alive!"));
+app.listen(3000, () => console.log("✅ Сервер для пинга запущен на порту 3000"));
+
 // ===== запуск =====
 client.login(TOKEN);
